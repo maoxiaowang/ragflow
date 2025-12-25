@@ -1030,7 +1030,7 @@ async def do_handle_task(task):
             return True
         e = await insert_es(task_id, task_tenant_id, task_dataset_id, _chunks, progress_callback)
         return bool(e)
-    
+
     try:
         if not await _maybe_insert_es(chunks):
             return
@@ -1140,52 +1140,86 @@ async def report_status():
     REDIS_CONN.sadd("TASKEXE", CONSUMER_NAME)
     redis_lock = RedisDistributedLock("clean_task_executor", lock_value=CONSUMER_NAME, timeout=60)
     while True:
+        now = datetime.now()
+        now_ts = now.timestamp()
+
+        # 获取消费组状态
         try:
-            now = datetime.now()
-            group_info = REDIS_CONN.queue_info(settings.get_svr_queue_name(0), SVR_CONSUMER_GROUP_NAME)
-            if group_info is not None:
-                PENDING_TASKS = int(group_info.get("pending", 0))
-                LAG_TASKS = int(group_info.get("lag", 0))
+            group_info = REDIS_CONN.queue_info(settings.get_svr_queue_name(0), SVR_CONSUMER_GROUP_NAME) or {}
+            PENDING_TASKS = int(group_info.get("pending", 0))
+            LAG_TASKS = int(group_info.get("lag", 0))
+        except Exception as e:
+            logging.warning(f"Heartbeat queue info failed to get: {e}")
 
-            pid = os.getpid()
-            ip_address = await get_server_ip()
-            current = copy.deepcopy(CURRENT_TASKS)
-            heartbeat = json.dumps({
-                "ip_address": ip_address,
-                "pid": pid,
-                "name": CONSUMER_NAME,
-                "now": now.astimezone().isoformat(timespec="milliseconds"),
-                "boot_at": BOOT_AT,
-                "pending": PENDING_TASKS,
-                "lag": LAG_TASKS,
-                "done": DONE_TASKS,
-                "failed": FAILED_TASKS,
-                "current": current,
-            })
-            REDIS_CONN.zadd(CONSUMER_NAME, heartbeat, now.timestamp())
-            logging.info(f"{CONSUMER_NAME} reported heartbeat: {heartbeat}")
+        heartbeat_data = {
+            "worker": CONSUMER_NAME,
+            "boot_at": BOOT_AT,
+            "pending": PENDING_TASKS,
+            "lag": LAG_TASKS,
+            "done": DONE_TASKS,
+            "failed": FAILED_TASKS,
+            "current": CURRENT_TASKS
+        }
+        try:
+            heartbeat = json.dumps(heartbeat_data, ensure_ascii=False)
+            REDIS_CONN.zadd(CONSUMER_NAME, heartbeat, now_ts)
+        except Exception as e:
+            logging.warning(f"Failed to report heartbeat: {e}")
+        else:
+            logging.info(
+                "heartbeat worker=%s pending=%d lag=%d done=%d failed=%d running=%d",
+                CONSUMER_NAME,
+                PENDING_TASKS,
+                LAG_TASKS,
+                DONE_TASKS,
+                FAILED_TASKS,
+                len(CURRENT_TASKS),
+            )
 
-            expired = REDIS_CONN.zcount(CONSUMER_NAME, 0, now.timestamp() - 60 * 30)
-            if expired > 0:
-                REDIS_CONN.zpopmin(CONSUMER_NAME, expired)
+        # 清理自身的过期心跳记录
+        try:
+            REDIS_CONN.REDIS.zremrangebyscore(CONSUMER_NAME, 0, now_ts -  60 * 30)
+        except Exception as e:
+            logging.warning(f"Failed to clean own heartbeat: {e}")
 
-            # clean task executor
-            if redis_lock.acquire():
-                task_executors = REDIS_CONN.smembers("TASKEXE")
+        # clean task executor（减小锁粒度）
+        try:
+            lock_acquired = redis_lock.acquire()
+        except Exception as e:
+            logging.warning(f"Failed to acquire redis lock: {e}")
+            lock_acquired = False
+
+        if lock_acquired:
+            try:
+                task_executors = REDIS_CONN.smembers("TASKEXE") or set()
                 for consumer_name in task_executors:
                     if consumer_name == CONSUMER_NAME:
                         continue
-                    expired = REDIS_CONN.zcount(
-                        consumer_name, now.timestamp() - WORKER_HEARTBEAT_TIMEOUT, now.timestamp() + 10
-                    )
-                    if expired == 0:
-                        logging.info(f"{consumer_name} expired, removed")
+
+                    try:
+                        last = REDIS_CONN.REDIS.zrevrange(consumer_name, 0, 0, withscores=True)
+                    except Exception:
+                        logging.warning(f"Failed to read zset for {consumer_name}")
+                        continue
+
+                    # 没有任何心跳直接清理
+                    if not last:
+                        logging.info(f"{consumer_name} expired, removed (no heartbeat)")
                         REDIS_CONN.srem("TASKEXE", consumer_name)
                         REDIS_CONN.delete(consumer_name)
-        except Exception:
-            logging.exception("report_status got exception")
-        finally:
-            redis_lock.release()
+                        continue
+
+                    # 最近心跳超过超时时间
+                    last_ts = last[0][1]
+                    if now_ts - last_ts > WORKER_HEARTBEAT_TIMEOUT:
+                        logging.info(f"{consumer_name} expired, removed (timeout)")
+                        REDIS_CONN.srem("TASKEXE", consumer_name)
+                        REDIS_CONN.delete(consumer_name)
+            except Exception as e:
+                logging.warning(f"Failed to clean other executors: {e}")
+            finally:
+                redis_lock.release()
+
         await asyncio.sleep(30)
 
 

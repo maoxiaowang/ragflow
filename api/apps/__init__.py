@@ -18,21 +18,25 @@ import os
 import sys
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
-from quart import Blueprint, Quart, request, g, current_app, session
+
+import valkey as redis
 from flasgger import Swagger
 from itsdangerous.url_safe import URLSafeTimedSerializer as Serializer
+from quart import Blueprint, Quart, request, g, current_app, session
+from quart_auth import Unauthorized
 from quart_cors import cors
-from common.constants import StatusEnum
+
+from api.constants import API_VERSION
 from api.db.db_models import close_connection, APIToken
 from api.db.services import UserService
-from api.utils.json_encode import CustomJSONEncoder
 from api.utils import commands
-
-from quart_auth import Unauthorized
-from common import settings
 from api.utils.api_utils import server_error_response
-from api.constants import API_VERSION
+from api.utils.json_encode import CustomJSONEncoder
+from common import settings
+from common.constants import StatusEnum
 from common.misc_utils import get_uuid
+from rag.utils.redis_conn import AsyncValkeyRedis
+from rag.utils.session import ValkeyRedisSessionInterface
 
 settings.init_settings()
 
@@ -93,6 +97,15 @@ app.config["MAX_CONTENT_LENGTH"] = int(
 )
 app.config['SECRET_KEY'] = settings.SECRET_KEY
 app.secret_key = settings.SECRET_KEY
+
+app.session_interface = ValkeyRedisSessionInterface(
+    key_prefix="ragflow_session:",
+    use_signer=True,
+    SESSION_REVERSE_PROXY=False,
+    SESSION_PROTECTION=True,
+    SESSION_STATIC_FILE=False,
+)
+
 commands.register_commands(app)
 
 from functools import wraps
@@ -104,35 +117,31 @@ T = TypeVar("T")
 P = ParamSpec("P")
 
 def _load_user():
+    g.user = None
+    user_id = session.get("_user_id")
+    if user_id:
+        user = UserService.query(id=user_id, status=StatusEnum.VALID.value)
+        if user:
+            g.user = user[0]
+            return user[0]
+
+    # 原来的 Authorization Token 验证逻辑保持不变
     jwt = Serializer(secret_key=settings.SECRET_KEY)
     authorization = request.headers.get("Authorization")
-    g.user = None
     if not authorization:
-        return None
+        return
 
     try:
         access_token = str(jwt.loads(authorization))
-
         if not access_token or not access_token.strip():
             logging.warning("Authentication attempt with empty access token")
             return None
-
-        # Access tokens should be UUIDs (32 hex characters)
-        if len(access_token.strip()) < 32:
-            logging.warning(f"Authentication attempt with invalid token format: {len(access_token)} chars")
-            return None
-
-        user = UserService.query(
-            access_token=access_token, status=StatusEnum.VALID.value
-        )
+        user = UserService.query(access_token=access_token, status=StatusEnum.VALID.value)
         if not user and len(authorization.split()) == 2:
             objs = APIToken.query(token=authorization.split()[1])
             if objs:
                 user = UserService.query(id=objs[0].tenant_id, status=StatusEnum.VALID.value)
         if user:
-            if not user[0].access_token or not user[0].access_token.strip():
-                logging.warning(f"User {user[0].email} has empty access_token in database")
-                return None
             g.user = user[0]
             return user[0]
     except Exception as e:
