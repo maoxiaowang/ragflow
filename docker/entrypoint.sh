@@ -39,16 +39,6 @@ CONSUMER_NO_BEG=0
 CONSUMER_NO_END=0
 WORKERS=1
 
-MCP_HOST="127.0.0.1"
-MCP_PORT=9382
-MCP_BASE_URL="http://127.0.0.1:9380"
-MCP_SCRIPT_PATH="/ragflow/mcp/server/server.py"
-MCP_MODE="self-host"
-MCP_HOST_API_KEY=""
-MCP_TRANSPORT_SSE_FLAG="--transport-sse-enabled"
-MCP_TRANSPORT_STREAMABLE_HTTP_FLAG="--transport-streamable-http-enabled"
-MCP_JSON_RESPONSE_FLAG="--json-response"
-
 # -----------------------------------------------------------------------------
 # Host ID logic:
 #   1. By default, use the system hostname if length <= 32
@@ -88,30 +78,6 @@ for arg in "$@"; do
       ;;
     --init-superuser)
       INIT_SUPERUSER_ARGS="--init-superuser"
-      shift
-      ;;
-    --mcp-host=*)
-      MCP_HOST="${arg#*=}"
-      shift
-      ;;
-    --mcp-port=*)
-      MCP_PORT="${arg#*=}"
-      shift
-      ;;
-    --mcp-base-url=*)
-      MCP_BASE_URL="${arg#*=}"
-      shift
-      ;;
-    --mcp-mode=*)
-      MCP_MODE="${arg#*=}"
-      shift
-      ;;
-    --mcp-host-api-key=*)
-      MCP_HOST_API_KEY="${arg#*=}"
-      shift
-      ;;
-    --mcp-script-path=*)
-      MCP_SCRIPT_PATH="${arg#*=}"
       shift
       ;;
     --no-transport-sse-enabled)
@@ -164,98 +130,84 @@ export LD_LIBRARY_PATH="/usr/lib/x86_64-linux-gnu/"
 PY=python3
 
 # -----------------------------------------------------------------------------
-# Function(s)
+# Utilities
 # -----------------------------------------------------------------------------
 
-function task_exe() {
-    local consumer_id="$1"
-    local host_id="$2"
-
-    JEMALLOC_PATH="$(pkg-config --variable=libdir jemalloc)/libjemalloc.so"
-    while true; do
-        LD_PRELOAD="$JEMALLOC_PATH" \
-        "$PY" rag/svr/task_executor.py "${host_id}_${consumer_id}"  &
-        wait;
-        sleep 1;
-    done
+get_jemalloc() {
+    pkg-config --variable=libdir jemalloc 2>/dev/null | sed 's#$#/libjemalloc.so#'
 }
 
-function start_mcp_server() {
-    echo "Starting MCP Server on ${MCP_HOST}:${MCP_PORT} with base URL ${MCP_BASE_URL}..."
-    "$PY" "${MCP_SCRIPT_PATH}" \
-        --host="${MCP_HOST}" \
-        --port="${MCP_PORT}" \
-        --base-url="${MCP_BASE_URL}" \
-        --mode="${MCP_MODE}" \
-        --api-key="${MCP_HOST_API_KEY}" \
-        "${MCP_TRANSPORT_SSE_FLAG}" \
-        "${MCP_TRANSPORT_STREAMABLE_HTTP_FLAG}" \
-        "${MCP_JSON_RESPONSE_FLAG}" &
-}
-
-function ensure_docling() {
-    [[ "${USE_DOCLING}" == "true" ]] || { echo "[docling] disabled by USE_DOCLING"; return 0; }
-    python3 -c 'import pip' >/dev/null 2>&1 || python3 -m ensurepip --upgrade || true
-    DOCLING_PIN="${DOCLING_VERSION:-==2.58.0}"
-    python3 -c "import importlib.util,sys; sys.exit(0 if importlib.util.find_spec('docling') else 1)" \
-      || python3 -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple --extra-index-url https://pypi.org/simple --no-cache-dir "docling${DOCLING_PIN}"
+ensure_docling() {
+    [[ "${USE_DOCLING}" == "true" ]] || { echo "[docling] disabled"; return 0; }
+    python3 -c 'import docling' >/dev/null 2>&1 && return 0
+    python3 -m ensurepip --upgrade || true
+    python3 -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple \
+        --extra-index-url https://pypi.org/simple \
+        --no-cache-dir "docling${DOCLING_VERSION:-==2.58.0}"
 }
 
 # -----------------------------------------------------------------------------
-# Start components based on flags
+# Service starters
 # -----------------------------------------------------------------------------
+
+start_ragflow_server() {
+    echo "[ragflow] starting ragflow server"
+
+    exec uvicorn \
+        api.asgi:app \
+        --host 0.0.0.0 \
+        --port ${SVR_HTTP_PORT:-9380} \
+        --workers 1 \
+        --log-level ${SVR_LOG_LEVEL:-info}
+}
+
+start_task_executor() {
+    CONSUMER_ID="${CONSUMER_ID:-${HOST_ID}}"
+    echo "[task-executor] starting worker, consumer_id=${CONSUMER_ID}"
+
+    JEMALLOC_PATH="$(get_jemalloc)"
+    if [[ -f "${JEMALLOC_PATH}" ]]; then
+        echo "[task-executor] using jemalloc: ${JEMALLOC_PATH}"
+        exec env LD_PRELOAD="${JEMALLOC_PATH}" \
+            "$PY" rag/svr/task_executor.py "${CONSUMER_ID}"
+    else
+        echo "[task-executor] jemalloc not found, fallback to glibc"
+        exec "$PY" rag/svr/task_executor.py "${CONSUMER_ID}"
+    fi
+}
+
+start_admin_server() {
+    echo "[admin] starting admin server"
+    exec "$PY" admin/server/admin_server.py
+}
+
+start_datasync() {
+    echo "[datasync] starting data sync worker"
+    exec "$PY" rag/svr/sync_data_source.py
+}
+
+
+# -----------------------------------------------------------------------------
+# Entrypoint
+# -----------------------------------------------------------------------------
+
 ensure_docling
 
-if [[ "${ENABLE_WEBSERVER}" -eq 1 ]]; then
-    echo "Starting nginx..."
-    /usr/sbin/nginx
-
-    echo "Starting ragflow_server..."
-    while true; do
-        "$PY" api/ragflow_server.py ${INIT_SUPERUSER_ARGS} &
-        wait;
-        sleep 1;
-    done &
-fi
-
-if [[ "${ENABLE_DATASYNC}" -eq 1 ]]; then
-    echo "Starting data sync..."
-    while true; do
-        "$PY" rag/svr/sync_data_source.py &
-        wait;
-        sleep 1;
-    done &
-fi
-
-if [[ "${ENABLE_ADMIN_SERVER}" -eq 1 ]]; then
-    echo "Starting admin_server..."
-    while true; do
-        "$PY" admin/server/admin_server.py &
-        wait;
-        sleep 1;
-    done &
-fi
-
-if [[ "${ENABLE_MCP_SERVER}" -eq 1 ]]; then
-    start_mcp_server
-fi
-
-
-if [[ "${ENABLE_TASKEXECUTOR}" -eq 1 ]]; then
-    if [[ "${CONSUMER_NO_END}" -gt "${CONSUMER_NO_BEG}" ]]; then
-        echo "Starting task executors on host '${HOST_ID}' for IDs in [${CONSUMER_NO_BEG}, ${CONSUMER_NO_END})..."
-        for (( i=CONSUMER_NO_BEG; i<CONSUMER_NO_END; i++ ))
-        do
-          task_exe "${i}" "${HOST_ID}" &
-        done
-    else
-        # Otherwise, start a fixed number of workers
-        echo "Starting ${WORKERS} task executor(s) on host '${HOST_ID}'..."
-        for (( i=0; i<WORKERS; i++ ))
-        do
-          task_exe "${i}" "${HOST_ID}" &
-        done
-    fi
-fi
-
-wait
+case "$SERVICE" in
+    ragflow)
+        start_ragflow_server
+        ;;
+    task-executor)
+        start_task_executor
+        ;;
+    admin)
+        start_admin_server
+        ;;
+    datasync)
+        start_datasync
+        ;;
+    *)
+        echo "[entrypoint] Unknown SERVICE=$SERVICE"
+        exit 1
+        ;;
+esac
