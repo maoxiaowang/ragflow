@@ -503,21 +503,3 @@ class RedisDistributedLock:
 
     def release(self):
         REDIS_CONN.delete_if_equal(self.lock_key, self.lock_value)
-
-
-class AsyncValkeyRedis:
-    def __init__(self, client):
-        self.client = client
-
-    async def setex(self, name, value, time):
-        # 因为 valkey 是同步的，用线程池跑
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self.client.set, name, value, time)
-
-    async def get(self, name):
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self.client.get, name)
-
-    async def delete(self, name):
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self.client.delete, name)
