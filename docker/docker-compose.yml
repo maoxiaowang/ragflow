@@ -39,6 +39,9 @@ services:
     build:
       context: ../
       dockerfile: Dockerfile
+#      args:
+#        http_proxy: http://192.168.2.36:29290
+#        https_proxy: http://192.168.2.36:29290
     profiles:
       - cpu
     depends_on:

@@ -61,6 +61,31 @@ git add .
 git commit -m "描述你的改动"
 ```
 
+#### 4). 提交 PR
+- 更新 main 分支
+参考 2)
+```shell
+git checkout main
+git fetch upstream
+git rebase upstream/main
+git push origin main --force-with-lease
+```
+- 新建 feature/bugfix 分支
+```shell
+git checkout -b feature/xxx
+```
+- 修改代码并提交
+```shell
+git add .
+git commit -m "Add xxx feature / fix bug"
+```
+- 推送分支
+```shell
+git push origin feature/xxx
+```
+- 提交PR
+打开 fork 页面，点击`Compare & pull request`按钮，填写相关信息提交。
+
 - 推送 adapt 分支
 ```shell
 git push origin adapt --force-with-lease
