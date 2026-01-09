@@ -512,19 +512,29 @@ def build_TOC(task, docs, progress_callback):
     toc: list[dict] = asyncio.run(
         run_toc_from_text([d["content_with_weight"] for d in docs], chat_mdl, progress_callback))
     logging.info("------------ T O C -------------\n" + json.dumps(toc, ensure_ascii=False, indent='  '))
-    ii = 0
-    while ii < len(toc):
+    for ii, item in enumerate(toc):
         try:
-            idx = int(toc[ii]["chunk_id"])
-            del toc[ii]["chunk_id"]
-            toc[ii]["ids"] = [docs[idx]["id"]]
-            if ii == len(toc) - 1:
-                break
-            for jj in range(idx + 1, int(toc[ii + 1]["chunk_id"]) + 1):
-                toc[ii]["ids"].append(docs[jj]["id"])
+            chunk_val = item.pop("chunk_id", None)
+            if chunk_val is None or str(chunk_val).strip() == "":
+                logging.warning(f"Index {ii}: chunk_id is missing or empty. Skipping.")
+                continue
+            curr_idx = int(chunk_val)
+            if curr_idx >= len(docs):
+                logging.error(f"Index {ii}: chunk_id {curr_idx} exceeds docs length {len(docs)}.")
+                continue
+            item["ids"] = [docs[curr_idx]["id"]]
+            if ii + 1 < len(toc):
+                next_chunk_val = toc[ii + 1].get("chunk_id", "")
+                if str(next_chunk_val).strip() != "":
+                    next_idx = int(next_chunk_val)
+                    for jj in range(curr_idx + 1, min(next_idx + 1, len(docs))):
+                        item["ids"].append(docs[jj]["id"])
+                else:
+                    logging.warning(f"Index {ii + 1}: next chunk_id is empty, range fill skipped.")
+        except (ValueError, TypeError) as e:
+            logging.error(f"Index {ii}: Data conversion error - {e}")
         except Exception as e:
-            logging.exception(e)
-        ii += 1
+            logging.exception(f"Index {ii}: Unexpected error - {e}")
 
     if toc:
         d = copy.deepcopy(docs[-1])
@@ -1117,7 +1127,7 @@ async def do_handle_task(task):
         if has_canceled(task_id):
             try:
                 exists = await asyncio.to_thread(
-                    settings.docStoreConn.indexExist,
+                    settings.docStoreConn.index_exist,
                     search.index_name(task_tenant_id),
                     task_dataset_id,
                 )
@@ -1141,15 +1151,15 @@ async def handle_task():
         return
 
     task_type = task["task_type"]
-    pipeline_task_type = TASK_TYPE_TO_PIPELINE_TASK_TYPE.get(task_type, PipelineTaskType.PARSE) or PipelineTaskType.PARSE
-
+    pipeline_task_type = TASK_TYPE_TO_PIPELINE_TASK_TYPE.get(task_type,
+                                                             PipelineTaskType.PARSE) or PipelineTaskType.PARSE
     task_id = task["id"]
     try:
         logging.info(f"handle_task begin for task {json.dumps(task)}")
         CURRENT_TASKS[task["id"]] = copy.deepcopy(task)
         await do_handle_task(task)
         DONE_TASKS += 1
-        CURRENT_TASKS.pop(task["id"], None)
+        CURRENT_TASKS.pop(task_id, None)
         logging.info(f"handle_task done for task {json.dumps(task)}")
     except Exception as e:
         FAILED_TASKS += 1
@@ -1188,90 +1198,80 @@ async def get_server_ip() -> str:
 
 
 async def report_status():
-    global CONSUMER_NAME, BOOT_AT, PENDING_TASKS, LAG_TASKS, DONE_TASKS, FAILED_TASKS
+    """
+    Periodically reports the executor's heartbeat
+    """
+    global PENDING_TASKS, LAG_TASKS, DONE_TASKS, FAILED_TASKS
+
+    ip_address = await get_server_ip()
+    pid = os.getpid()
+
+    # Register the executor in Redis
     REDIS_CONN.sadd("TASKEXE", CONSUMER_NAME)
     redis_lock = RedisDistributedLock("clean_task_executor", lock_value=CONSUMER_NAME, timeout=60)
+
     while True:
         now = datetime.now()
         now_ts = now.timestamp()
 
-        # 获取消费组状态
-        try:
-            group_info = REDIS_CONN.queue_info(settings.get_svr_queue_name(0), SVR_CONSUMER_GROUP_NAME) or {}
-            PENDING_TASKS = int(group_info.get("pending", 0))
-            LAG_TASKS = int(group_info.get("lag", 0))
-        except Exception as e:
-            logging.warning(f"Heartbeat queue info failed to get: {e}")
+        group_info = REDIS_CONN.queue_info(settings.get_svr_queue_name(0), SVR_CONSUMER_GROUP_NAME) or {}
+        PENDING_TASKS = int(group_info.get("pending", 0))
+        LAG_TASKS = int(group_info.get("lag", 0))
 
-        heartbeat_data = {
-            "worker": CONSUMER_NAME,
+        current = copy.deepcopy(CURRENT_TASKS)
+        heartbeat = json.dumps({
+            "ip_address": ip_address,
+            "pid": pid,
+            "name": CONSUMER_NAME,
+            "now": now.astimezone().isoformat(timespec="milliseconds"),
             "boot_at": BOOT_AT,
             "pending": PENDING_TASKS,
             "lag": LAG_TASKS,
             "done": DONE_TASKS,
             "failed": FAILED_TASKS,
-            "current": CURRENT_TASKS
-        }
+            "current": current,
+        })
+
+        # Report heartbeat to Redis
         try:
-            heartbeat = json.dumps(heartbeat_data, ensure_ascii=False)
             REDIS_CONN.zadd(CONSUMER_NAME, heartbeat, now_ts)
         except Exception as e:
             logging.warning(f"Failed to report heartbeat: {e}")
         else:
-            logging.info(
-                "heartbeat worker=%s pending=%d lag=%d done=%d failed=%d running=%d",
-                CONSUMER_NAME,
-                PENDING_TASKS,
-                LAG_TASKS,
-                DONE_TASKS,
-                FAILED_TASKS,
-                len(CURRENT_TASKS),
-            )
+            logging.info(f"{CONSUMER_NAME} reported heartbeat: {heartbeat}")
 
-        # 清理自身的过期心跳记录
+        # Clean up own expired heartbeat
         try:
-            REDIS_CONN.REDIS.zremrangebyscore(CONSUMER_NAME, 0, now_ts -  60 * 30)
+            REDIS_CONN.zremrangebyscore(CONSUMER_NAME, 0, now_ts - 60 * 30)
         except Exception as e:
-            logging.warning(f"Failed to clean own heartbeat: {e}")
+            logging.warning(f"Failed to clean heartbeat: {e}")
 
-        # clean task executor（减小锁粒度）
+        # Clean other executors
+        lock_acquired = False
         try:
             lock_acquired = redis_lock.acquire()
         except Exception as e:
-            logging.warning(f"Failed to acquire redis lock: {e}")
-            lock_acquired = False
-
+            logging.warning(f"Failed to acquire Redis lock: {e}")
         if lock_acquired:
             try:
                 task_executors = REDIS_CONN.smembers("TASKEXE") or set()
-                for consumer_name in task_executors:
-                    if consumer_name == CONSUMER_NAME:
+                for worker_name in task_executors:
+                    if worker_name == CONSUMER_NAME:
                         continue
-
                     try:
-                        last = REDIS_CONN.REDIS.zrevrange(consumer_name, 0, 0, withscores=True)
-                    except Exception:
-                        logging.warning(f"Failed to read zset for {consumer_name}")
+                        last_heartbeat = REDIS_CONN.REDIS.zrevrange(worker_name, 0, 0, withscores=True)
+                    except Exception as e:
+                        logging.warning(f"Failed to read zset for {worker_name}: {e}")
                         continue
 
-                    # 没有任何心跳直接清理
-                    if not last:
-                        logging.info(f"{consumer_name} expired, removed (no heartbeat)")
-                        REDIS_CONN.srem("TASKEXE", consumer_name)
-                        REDIS_CONN.delete(consumer_name)
-                        continue
-
-                    # 最近心跳超过超时时间
-                    last_ts = last[0][1]
-                    if now_ts - last_ts > WORKER_HEARTBEAT_TIMEOUT:
-                        logging.info(f"{consumer_name} expired, removed (timeout)")
-                        REDIS_CONN.srem("TASKEXE", consumer_name)
-                        REDIS_CONN.delete(consumer_name)
+                    if not last_heartbeat or now_ts - last_heartbeat[0][1] > WORKER_HEARTBEAT_TIMEOUT:
+                        logging.info(f"{worker_name} expired, removed")
+                        REDIS_CONN.srem("TASKEXE", worker_name)
+                        REDIS_CONN.delete(worker_name)
             except Exception as e:
                 logging.warning(f"Failed to clean other executors: {e}")
             finally:
                 redis_lock.release()
-
         await asyncio.sleep(30)
 
 
